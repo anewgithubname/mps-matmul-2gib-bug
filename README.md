@@ -119,18 +119,35 @@ These results come from variants of the program above, on the same machine:
 | Result crosses, interior dimension K ≤ 7 | no |
 | Left operand crosses a 2 GiB-aligned address, result does not | no |
 | Result crosses only a 1 GiB-aligned address | no |
+| Result crosses, buffer allocated from an `MTLHeap` | yes |
+| Result crosses, private storage mode | yes |
 | Same GEMM, result inside a 2 GiB window | no |
+| MPSGraph `matrixMultiplication` with the result crossing | no |
+| `MPSNDArrayMatrixMultiplication` with the result crossing | no |
 | `MPSMatrixVectorMultiplication` with the result crossing | no |
 | Custom Metal compute kernels writing across the boundary | no |
 
-Because a buffer of 2 GiB or more always spans such an address, any MPS GEMM
-with a result that large is affected, wherever it is allocated. For example,
-a 60000×10000 float distance matrix (2.4 GB) is affected.
+Because a buffer of 2 GiB or more always spans such an address, any
+`MPSMatrixMultiplication` with a result that large is affected, wherever it is
+allocated. For example, a 60000×10000 float distance matrix (2.4 GB) is
+affected.
+
+PyTorch is not affected. PyTorch 2.9.1 does not use `MPSMatrixMultiplication`:
+its MPS matmuls go through MPSGraph, and in some cases
+`MPSNDArrayMatrixMultiplication`. `torch.mm`, `addmm`, `bmm` and `matmul`
+writing into a tensor that crosses a boundary, and a 2.4 GB `A @ B`, all give
+correct results.
 
 ## Workaround
 
-Keep MPS GEMM results out of buffers that cross a 2 GiB boundary. Before each
-GEMM, check the result buffer's `gpuAddress` range. If it crosses a boundary:
+The simplest option is to compute the GEMM with MPSGraph
+`matrixMultiplication` or `MPSNDArrayMatrixMultiplication` instead. Neither
+was affected in our tests. We have only tested this on the machine above, so
+check performance and results before switching.
+
+To keep using `MPSMatrixMultiplication`, keep its results out of buffers that
+cross a 2 GiB boundary. Before each GEMM, check the result buffer's
+`gpuAddress` range. If it crosses a boundary:
 
 1. Compute the product in row blocks (or groups of batch matrices) of at most
    256 MB.
@@ -145,7 +162,8 @@ disabled.
 
 ## Related reports
 
-None of these reports describe this trigger. The closest is the PyTorch issue.
+None of these reports describe this trigger, and both involve MPSGraph, which
+this bug does not affect, so they are probably different bugs.
 
 - [pytorch/pytorch#111634](https://github.com/pytorch/pytorch/issues/111634):
   wrong results from large matmuls on MPS. A maintainer described it as an
