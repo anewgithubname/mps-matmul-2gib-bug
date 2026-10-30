@@ -10,6 +10,21 @@ affected, and K of 8 or more is.
 
 We found no mention of this in Apple's documentation or developer forums.
 
+## Test on your Mac
+
+With the Command Line Tools installed (`xcode-select --install`), run:
+
+```sh
+git clone --depth 1 https://github.com/anewgithubname/mps-matmul-2gib-bug && cd mps-matmul-2gib-bug && ./run.sh; sw_vers; sysctl -n hw.model
+```
+
+It takes a few seconds and ends with `BUG REPRODUCED` or `no corruption
+observed`. Either way, please
+[open an issue](https://github.com/anewgithubname/mps-matmul-2gib-bug/issues/new)
+with the full output, so we can track which chips and macOS versions are
+affected. Results from a virtual machine do not count: its GPU is
+paravirtualized.
+
 ## Reproduce
 
 ```sh
