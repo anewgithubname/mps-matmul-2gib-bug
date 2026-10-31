@@ -16,9 +16,13 @@
 
 static const uint64_t kTwoGiB = 1ull << 31;
 
-static bool crosses2GiB(id<MTLBuffer> b) {
-    return b.gpuAddress / kTwoGiB != (b.gpuAddress + b.length - 1) / kTwoGiB;
+static bool crosses2GiB(id<MTLBuffer> b, uint64_t margin = 0) {
+    return b.gpuAddress / kTwoGiB != (b.gpuAddress + b.length + margin - 1) / kTwoGiB;
 }
+
+// A buffer that ends less than about 8 MiB below a boundary is also corrupted
+// (see mps_matmul_near_2gib.mm), so the reference buffer keeps a wider margin.
+static const uint64_t kMargin = 16ull << 20;
 
 static bool tty = false;
 
@@ -77,9 +81,10 @@ int main(int argc, char** argv) {
     for (NSUInteger i = 0; i < M * K; ++i) ((float*)A.contents)[i] = rand() / (float)RAND_MAX;
     for (NSUInteger i = 0; i < K * N; ++i) ((float*)B.contents)[i] = rand() / (float)RAND_MAX;
 
-    // Two result buffers of the same size: one inside a 2 GiB-aligned window,
-    // one straddling a 2 GiB boundary. Allocate result-sized buffers until both
-    // exist. The extra buffers are never touched, so they cost address space only.
+    // Two result buffers of the same size: one inside a 2 GiB-aligned window
+    // and at least kMargin below its end, one straddling a 2 GiB boundary.
+    // Allocate result-sized buffers until both exist. The extra buffers are
+    // never touched, so they cost address space only.
     const NSUInteger resultBytes = M * N * sizeof(float);
     id<MTLBuffer> inside = nil, straddling = nil;
     std::vector<id<MTLBuffer>> padding;
@@ -87,7 +92,7 @@ int main(int argc, char** argv) {
         id<MTLBuffer> b = newBuffer(resultBytes);
         if (!b) break;
         if (crosses2GiB(b) && !straddling) straddling = b;
-        else if (!crosses2GiB(b) && !inside) inside = b;
+        else if (!crosses2GiB(b, kMargin) && !inside) inside = b;
         else padding.push_back(b);
     }
     if (!inside || !straddling) {
