@@ -6,8 +6,14 @@ differs between the first and last byte of the result. It also does so when
 the result does not cross such an address but ends less than about 8 MiB
 below one. The same multiplication into an identical buffer away from a
 boundary is correct. The input values and the result size do not matter: a
-4 MB result is enough. The interior dimension K does matter: K of 7 or less is
-not affected, and K of 8 or more is.
+4 MB result is enough.
+
+The bug is in one GPU kernel. On an Apple M2, `MPSMatrixMultiplication` runs
+`MatrixMultiplyNNA14_M32_N128_singlebuffer_edgecase_all_types` for most
+shapes, and only that kernel is affected. MPS picks other kernels, which are
+not affected, when K is 7 or less, or when M and N are multiples of 64 and K is
+a multiple of 16. An Apple M4 runs a different kernel for every shape and is not
+affected. macOS 27.2 still has the bug.
 
 We found no mention of this in Apple's documentation or developer forums.
 
@@ -16,11 +22,12 @@ We found no mention of this in Apple's documentation or developer forums.
 With the Command Line Tools installed (`xcode-select --install`), run:
 
 ```sh
-git clone --depth 1 https://github.com/anewgithubname/mps-matmul-2gib-bug && cd mps-matmul-2gib-bug && ./run.sh; ./run.sh near; sw_vers; sysctl -n hw.model
+git clone --depth 1 https://github.com/anewgithubname/mps-matmul-2gib-bug && cd mps-matmul-2gib-bug && ./run.sh; ./run.sh near; ./run.sh trace 6000 2500 64 | grep pipeline; sw_vers; sysctl -n hw.model
 ```
 
-It takes a few seconds. Each of the two programs ends with `BUG REPRODUCED` or
-`no corruption observed`. Either way, please
+It takes a few seconds. Each of the first two programs ends with
+`BUG REPRODUCED` or `no corruption observed`, and the last one prints the name
+of the GPU kernel that MPS runs. Either way, please
 [open an issue](https://github.com/anewgithubname/mps-matmul-2gib-bug/issues/new)
 with the full output, so we can track which chips and macOS versions are
 affected. Results from a virtual machine do not count: its GPU is
@@ -33,12 +40,16 @@ paravirtualized.
 ./run.sh 4000 1000 32
 ./run.sh near       # result buffers that end just below a boundary
 ./run.sh near 4000 1000 32
+./run.sh align      # results across 1 GiB, 2 GiB, 4 GiB, ... aligned addresses
+./run.sh trace      # the GPU kernels MPS runs; takes several M N K triples
 ```
 
-[`run.sh`](run.sh) builds [`mps_matmul_2gib.mm`](mps_matmul_2gib.mm), or
-[`mps_matmul_near_2gib.mm`](mps_matmul_near_2gib.mm) with `near`, into
-`$TMPDIR` and runs it. Both programs use only Metal and
-MetalPerformanceShaders.
+[`run.sh`](run.sh) builds one program into `$TMPDIR` and runs it:
+[`mps_matmul_2gib.mm`](mps_matmul_2gib.mm) by default,
+[`mps_matmul_near_2gib.mm`](mps_matmul_near_2gib.mm) with `near`,
+[`mps_matmul_align.mm`](mps_matmul_align.mm) with `align`, and
+[`mps_gemm_trace.mm`](mps_gemm_trace.mm) with `trace`. All of them use only
+Metal and MetalPerformanceShaders, plus the Objective-C runtime for `trace`.
 
 `mps_matmul_2gib.mm` does the following:
 
@@ -60,8 +71,19 @@ one result buffer at exact distances below a 2 GiB boundary: 16 MiB, 12 MiB,
 None of these buffers crosses the boundary. The program runs the same GEMM into
 each buffer and counts the NaNs.
 
-Both programs exit with 1 when they see the bug, 0 when they do not, and 2
-when they cannot place a buffer at a boundary.
+`mps_matmul_align.mm` allocates untouched 2 GiB buffers to walk the GPU address
+space. For each alignment it finds, from 2^30 upward, it places the result
+across an address that is a multiple of that power of two and of no higher
+one, runs the GEMM, and compares the result with a reference computed away
+from any 1 GiB boundary. It also prints the bits of the first NaN.
+
+These three programs exit with 1 when they see the bug, 0 when they do not,
+and 2 when they cannot place a buffer at a boundary.
+
+`mps_gemm_trace.mm` replaces methods of the compute encoder class that Metal
+returns on this machine, then encodes one `MPSMatrixMultiplication` per shape.
+For each shape it prints the label of every pipeline MPS sets, which is the
+kernel name, and the buffers, constants, threadgroup memory and dispatch sizes.
 
 To build by hand:
 
@@ -71,7 +93,7 @@ clang++ -std=c++17 -O2 -fobjc-arc mps_matmul_2gib.mm \
     -o mps_matmul_2gib
 ```
 
-Build `mps_matmul_near_2gib.mm` the same way.
+Build the other programs the same way.
 
 If the linker rejects the Command Line Tools SDK (`tapi error: malformed file`),
 add `-isysroot $(xcode-select -p)/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk`.
@@ -80,7 +102,8 @@ add `-isysroot $(xcode-select -p)/Platforms/MacOSX.platform/Developer/SDKs/MacOS
 ## Observed output
 
 On an Apple M2 (Mac14,2, 16 GB) with macOS 27.0.1 (26A434), the output is
-identical on every run:
+identical on every run. After an update to macOS 27.2 (26B123), every program
+in this repository prints the same output apart from GPU addresses.
 
 ```
 device Apple M2, C = A(6000x64) * B(64x2500), result 60.0 MB
@@ -147,13 +170,65 @@ gpuAddress [0x1580000000, 0x1583938700)  starts at the boundary              NaN
 BUG REPRODUCED
 ```
 
+## Which kernel is affected
+
+`./run.sh trace` shows which kernel `MPSMatrixMultiplication` runs. We ran it,
+and the reproductions, on these machines. The M4 is a bare-metal EC2
+`mac-m4.metal` instance, not a virtual machine.
+
+| Machine | macOS | MPS framework | Kernel for 6000 × 2500 × 64 | Affected? |
+|---|---|---|---|---|
+| Apple M2 (Mac14,2) | 27.0.1 (26A434) | 130.0.19 | not traced | yes |
+| Apple M2 (Mac14,2) | 27.2 (26B123) | 130.1.4 | `MatrixMultiplyNNA14_M32_N128_singlebuffer_edgecase_all_types` | yes |
+| Apple M4 (Mac16,10) | 27.0 (26A428) | 130.0.19 | `mmul_kernel_a16_float_float_float` | no |
+
+The M4 has the same MPS framework version as the M2 on 27.0.1, but a newer GPU
+family, and MPS gives it a different kernel. On the M4, `./run.sh` and
+`./run.sh near` found no NaNs for 6000 × 2500 × 64 and 4000 × 1000 × 32, and
+`./run.sh align` found none across multiples of 2^30 through 2^38 for
+6000 × 2500 × 64. The M4 used
+`mmul_kernel_a16_float_float_float` for every shape we traced, including
+K = 7 and K = 8.
+
+On the M2, MPS chooses among three kernels by shape:
+
+| Shape (M × N × K) | Kernel | Affected? |
+|---|---|---|
+| K ≤ 7 (traced with K = 7) | `MatrixMultiplyNN` | no |
+| M and N multiples of 64, K a multiple of 16 | `MatrixMultiplyNNA14_M32_N128_singlebuffer_all_types` | no |
+| Any other shape | `MatrixMultiplyNNA14_M32_N128_singlebuffer_edgecase_all_types` | yes |
+
+We derived the rule in the second row from 12 traced shapes. For example,
+6016 × 2496 × 64 and 6016 × 2560 × 16 get the kernel without `edgecase`, while
+6048 × 2560 × 64 (M a multiple of 32 only), 6016 × 2528 × 64 (N a multiple of 32 only)
+and 6016 × 2560 × 24 (K a multiple of 8 only) get the `edgecase` kernel. Seven
+shapes that follow the rule (6016 × 2560 × 64, 6016 × 2496 × 64,
+6016 × 2560 × 16, 6016 × 2560 × 48, 4096 × 4096 × 64, 4096 × 4096 × 128 and
+1024 × 4096 × 32) gave no NaNs in `./run.sh`, `./run.sh near` or `./run.sh align`.
+6016 × 2560 × 24, where only K breaks the rule, gave NaNs in all three. So did
+shapes where only M (6000 × 2560 × 64) or only N (6016 × 2500 × 64) breaks it.
+
+Both A14 kernels run 16 × 16 threads per threadgroup. The grid sizes imply that
+each threadgroup computes a 64 × 64 block of the result: 6000 × 2500 gives
+40 × 94 threadgroups, and 4096 × 4096 gives 64 × 64. This matches the
+corruption, which always covers whole multiples of 64 rows. In the 6000 × 2500 × 64 run, the NaN band starts at row
+3584 = 56 × 64 and ends after row 4415 = 69 × 64 − 1.
+
+`./run.sh align` also shows that the boundary can be any multiple of 2 GiB.
+Results across multiples of 2^31 through 2^35 and 2^37 (the walk did not reach
+2^36) all get the same NaN band, while a result across a multiple of 2^30 only
+is correct. The NaNs have the bits `0x7fc00000`, the default NaN that
+floating-point arithmetic produces.
+
 ## What does and does not trigger it
 
-These results come from variants of the program above, on the same machine:
+These results come from variants of the program above, on the M2:
 
 | Configuration | Corrupted? |
 |---|---|
 | Result buffer crosses a 2 GiB-aligned address | yes |
+| Result crosses a multiple of 4 GiB, 8 GiB, 16 GiB, 32 GiB or 128 GiB | yes |
+| Result crosses, M and N multiples of 64, K a multiple of 16 | no |
 | Result ends 7.5 MiB or less below a boundary, does not cross it | yes |
 | Result ends 8 MiB or more below a boundary | no |
 | Result starts at or above a boundary | no |
@@ -191,10 +266,18 @@ correct results.
 
 The simplest option is to compute the GEMM with MPSGraph
 `matrixMultiplication` or `MPSNDArrayMatrixMultiplication` instead. Neither
-was affected in our tests. We have only tested this on the machine above, so
-check performance and results before switching.
+was affected in our tests. We have only tested this on the M2, so check
+performance and results before switching.
 
-To keep using `MPSMatrixMultiplication`, keep its results away from 2 GiB
+To keep using `MPSMatrixMultiplication`, you can pad the problem so that M and
+N are multiples of 64 and K is a multiple of 16. Pad `A` and `B` with zeros,
+multiply into a padded result, and use its top-left M × N block. MPS then runs
+the kernel without `edgecase`, which gave correct results in all our tests.
+This relies on how MPS chooses kernels on the M2, which Apple does not
+document and could change in any update, so check with `./run.sh trace` which
+kernel your padded shapes get.
+
+Otherwise, keep the results of `MPSMatrixMultiplication` away from 2 GiB
 boundaries. Checking only whether the result crosses a boundary is not enough.
 Before each GEMM:
 

@@ -1,14 +1,17 @@
 #!/bin/sh
-# Build and run a reproduction: ./run.sh [near] [M N K]
+# Build and run a reproduction: ./run.sh [near|align|trace] [M N K]
 #   ./run.sh         result buffers inside a 2 GiB window and across a boundary
 #   ./run.sh near    result buffers that end just below a boundary
+#   ./run.sh align   results across 1 GiB, 2 GiB, 4 GiB, ... aligned addresses
+#   ./run.sh trace   the GPU kernels MPSMatrixMultiplication runs (several M N K allowed)
 set -e
 cd "$(dirname "$0")"
 prog=mps_matmul_2gib
-if [ "$1" = near ]; then
-    prog=mps_matmul_near_2gib
-    shift
-fi
+case "$1" in
+near) prog=mps_matmul_near_2gib; shift ;;
+align) prog=mps_matmul_align; shift ;;
+trace) prog=mps_gemm_trace; shift ;;
+esac
 out="${TMPDIR:-/tmp}/$prog"
 build() {
     clang++ -std=c++17 -O2 -fobjc-arc "$@" $prog.mm \
